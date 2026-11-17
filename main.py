@@ -1,4 +1,77 @@
-#1
+# ===== فحص المكتبات وتثبيت الناقص قبل تشغيل السورس =====
+import importlib
+import subprocess
+import sys
+
+
+def _ensure_dependencies():
+    # اسم الاستيراد: اسم الحزمة بالتثبيت
+    packages = {
+        "telethon": "Telethon",
+        "brotli": "Brotli",
+        "getids": "getids",
+        "googletrans": "googletrans>=4.0.2",
+        "requests": "requests",
+        "PIL": "Pillow",
+        "yt_dlp": "yt-dlp",
+    }
+
+    missing = []
+
+    for module_name, package_name in packages.items():
+        try:
+            importlib.import_module(module_name)
+        except ModuleNotFoundError:
+            missing.append(package_name)
+        except ImportError as exc:
+            raise SystemExit(
+                f"المكتبة {module_name} موجودة لكن استيرادها فشل:\n{exc}"
+            ) from exc
+
+    if not missing:
+        print("✓ كل المكتبات موجودة.")
+        return
+
+    print("المكتبات الناقصة:", ", ".join(missing))
+    print("جاري التثبيت...")
+
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                *missing,
+            ],
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise SystemExit(
+            "\nفشل تثبيت المكتبات؛ راجع رسالة الخطأ أعلاه.\n"
+            "تأكد من الإنترنت ووجود pip وصلاحية التثبيت.\n"
+            "إذا ظهر externally-managed-environment، "
+            "شغّل السورس داخل بيئة افتراضية venv."
+        ) from exc
+
+    importlib.invalidate_caches()
+
+    # التأكد من نجاح استيراد المكتبات بعد التثبيت
+    for module_name in packages:
+        try:
+            importlib.import_module(module_name)
+        except ImportError as exc:
+            raise SystemExit(
+                f"تعذر استيراد {module_name} بعد التثبيت:\n{exc}"
+            ) from exc
+
+    print("✓ اكتمل تثبيت المكتبات، جاري تشغيل السورس.")
+
+
+_ensure_dependencies()
+# ===== نهاية فحص المكتبات =====
+
 import builtins
 builtins.print = lambda *args, **kwargs: None
 import asyncio
@@ -1711,27 +1784,30 @@ async def _(event):
 
     await edit_or_reply(m, status)
 
+
 @cmd(r"ترجمة(?:\s|$)([\s\S]*)")
 async def _(event):
     reply = await event.get_reply_message()
     arg = event.pattern_match.group(1)
     lang = (arg.strip() or "ar") if arg else "ar"
+
     if reply and reply.text:
         text = reply.text
     elif arg and len(arg.strip().split(maxsplit=1)) > 1:
         lang, text = arg.strip().split(maxsplit=1)
     else:
         return await edit_delete(event, "- رد على نص | مثال: ترجمة en", 8)
+
     try:
         from googletrans import Translator
-        tr = Translator()
-        res = tr.translate(text, dest=lang)
+        async with Translator() as tr:
+            res = await tr.translate(text, dest=lang)
+
         await edit_or_reply(
             event, f"**الترجمة ({res.src} | {lang}):**\n\n{res.text}"
         )
     except Exception as e:
         await edit_delete(event, f"- تعذر الترجمة (ثبّت googletrans): `{e}`", 10)
-
 
 
 spam_targets = {}
