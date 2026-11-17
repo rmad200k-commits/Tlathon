@@ -1,4 +1,5 @@
-
+import builtins
+builtins.print = lambda *args, **kwargs: None
 import asyncio
 import gzip
 import html
@@ -64,14 +65,21 @@ from telethon.tl.types import (
     User,
     Channel,
     Chat,
+    DocumentAttributeAudio,        # ← أضف هذا
+    DocumentAttributeFilename,     # ← وأضف هذا
 )
 
-
+import shutil
+import tempfile
+import concurrent.futures
+import urllib.request
+import urllib.parse
+import urllib.error
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-
+THUMBNAIL_PATH = os.path.join(DATA_DIR, "yt_thumb.jpg")   # ← أضف هذا السطر
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -93,10 +101,10 @@ def load_config():
         cfg.get("STRING_SESSION") or os.environ.get("STRING_SESSION") or ""
     )
     cfg["PREFIX"] = cfg.get("PREFIX") or "."
-    cfg["OWNER_NAME"] = cfg.get("OWNER_NAME") or "حمزة"
+    cfg["OWNER_NAME"] = cfg.get("OWNER_NAME") or "الجوكر"
     if not cfg["API_ID"] or not cfg["API_HASH"]:
         print("=" * 45)
-        print("  إعداد سورس حمزة — أدخل بياناتك:")
+        pass
         print("=" * 45)
         try:
             aid = input("* API_ID: ").strip()
@@ -197,9 +205,9 @@ client = TelegramClient(
     StringSession(CONFIG["STRING_SESSION"]),
     CONFIG["API_ID"],
     CONFIG["API_HASH"],
-    device_model="Hamza Userbot",
+    device_model="rkkyk Userbot",
     system_version="Android 12",
-    app_version="Hamza 2.3",
+    app_version="rkkyk 2.3",
     lang_code="ar",
     system_lang_code="ar",
     auto_reconnect=True,
@@ -376,7 +384,7 @@ def readable_time(seconds):
 
 
 
-MENU_MAIN = f"""✦ ────『قـائـمـة اوامر سورس حـمـزة』──── ✦
+MENU_MAIN = f"""✦ ────『قـائـمـة اوامر سورس الـجـوكر』──── ✦
 مرحبا بك عزيزي {OWNER_NAME}
 
 • `{PREFIX}م1` ➪ اوامـر الاداره
@@ -401,9 +409,191 @@ MENU_MAIN = f"""✦ ────『قـائـمـة اوامر سورس حـمـ
 • `{PREFIX}م20` ➪ اوامـر الكتم
 • `{PREFIX}م21` ➪ اوامـر التفليش
 • `{PREFIX}م22` ➪ اوامـر التحميل
-
+• `{PREFIX}م23` ➪ اوامـر النشر التلقائي
+• `{PREFIX}م24` ➪ اوامـر حفظ المؤقتة
 ✦ ─────────────────────────── ✦"""
+# ═══════════════════════════════════════════════════════════
+#  م24 — الحفظ التلقائي للوسائط ذاتية التدمير
+# ═══════════════════════════════════════════════════════════
 
+def _selfsave_enabled():
+    return db_get("settings", "selfsave_enabled", False)
+
+@cmd(r"تشغيل حفظ المؤقتة$")
+async def _(event):
+    db_set("settings", "selfsave_enabled", True)
+    await edit_or_reply(event,
+        "✅ تم **تفعيل** الحفظ التلقائي\n\n"
+        "🔒 كل وسائط ذاتية التدمير (صورة/فيديو) تُرسل لك في الخاص، "
+        "سيتم نسخها فوراً إلى المحفوظات مع معلومات المرسل."
+    )
+
+
+@cmd(r"تعطيل حفظ المؤقتة$")
+async def _(event):
+    db_set("settings", "selfsave_enabled", False)
+    await edit_or_reply(event, "🛑 تم **تعطيل** الحفظ التلقائي")
+
+
+@cmd(r"حفظ المؤقتة$")
+async def _(event):
+    status = "🟢 **مفعل**" if _selfsave_enabled() else "🔴 **معطل**"
+    await edit_or_reply(event,
+    f"**⚙️ حالة حفظ المؤقتة:** {status}\n\n"
+    f"📌 يلتقط الوسائط ذاتية التدمير فوراً وينسخها للمحفوظات مع اسم المرسل والآيدي والوقت.\n\n"
+    f"▶️ `.تشغيل حفظ المؤقتة`\n"
+    f"⏹️ `.تعطيل حفظ المؤقتة`"
+)
+
+@client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private and e.media))
+async def _save_self_destruct(event):
+    if not _selfsave_enabled():
+        return
+
+    try:
+        media = event.message.media
+        if media is None:
+            return
+
+        ttl = getattr(media, "ttl_seconds", 0) or 0
+        if not ttl:
+            ttl = getattr(event.message, "ttl_period", 0) or 0
+        if not ttl:
+            return
+
+        sender = await event.get_sender()
+        if not sender:
+            return
+
+        sender_id = sender.id
+
+        # 🔹 جلب بيانات كاملة
+        try:
+            fresh = await client.get_entity(sender_id)
+            if fresh:
+                sender = fresh
+        except Exception as e:
+            print(f"[selfsave] get_entity: {e}")
+
+        try:
+            pfull = await client(functions.users.GetFullUserRequest(sender))
+            users_list = getattr(pfull, "users", None) or []
+            for u in users_list:
+                if getattr(u, "id", None) == sender_id:
+                    sender = u
+                    break
+        except Exception as e:
+            print(f"[selfsave] get_full: {e}")
+
+        first = getattr(sender, "first_name", "") or ""
+        last = getattr(sender, "last_name", "") or ""
+        sender_name = (first + " " + last).strip() or "مجهول"
+
+        # 🔹 اليوزر
+        sender_username = getattr(sender, "username", None)
+        if not sender_username:
+            usernames_list = getattr(sender, "usernames", None) or []
+            for un in usernames_list:
+                if getattr(un, "active", False):
+                    sender_username = getattr(un, "username", None)
+                    break
+            if not sender_username and usernames_list:
+                sender_username = getattr(usernames_list[0], "username", None)
+
+        username_str = f"@{sender_username}" if sender_username else "لا يوجد"
+
+        # 🔹 الوقت
+        now_obj = datetime.now()
+        hour = int(now_obj.strftime("%I"))
+        minute = now_obj.strftime("%M")
+        am_pm = "م" if now_obj.strftime("%p") == "PM" else "ص"
+        time_str = f"{hour}:{minute} {am_pm}"
+        date_str = now_obj.strftime("%Y-%m-%d")
+
+        media_type = "🖼️ صورة"
+        if "Document" in type(media).__name__:
+            media_type = "🎬 فيديو"
+
+        if ttl >= 2147483640 or ttl > 86400:
+            duration_str = "🔥 مشاهدة واحدة"
+        elif ttl >= 3600:
+            h = ttl // 3600
+            m = (ttl % 3600) // 60
+            duration_str = f"{h}س {m}د" if m else f"{h} ساعة"
+        elif ttl >= 60:
+            duration_str = f"{ttl // 60} دقيقة"
+        else:
+            duration_str = f"{ttl} ثانية"
+
+        # 🔹 بناء النص والتنسيقات (الاسم كرابط tg://user?id=)
+        parts = []
+        ents = []
+
+        def add(text, ent_cls=None, **kw):
+            offset = sum(len(p) for p in parts)
+            parts.append(text)
+            if ent_cls:
+                ents.append(ent_cls(offset=offset, length=len(text), **kw))
+
+        add("🔒 ")
+        add("وسائط ذاتية التدمير", types.MessageEntityBold)
+        add("\n\n👤 ")
+        add("المرسل: ", types.MessageEntityBold)
+        # 🔗 الاسم كرابط مباشر للحساب
+        add(
+            sender_name,
+            types.MessageEntityTextUrl,
+            url=f"tg://user?id={sender_id}",
+        )
+        add("\n🆔 ")
+        add("الآيدي: ", types.MessageEntityBold)
+        add(str(sender_id), types.MessageEntityCode)
+        add("\n🔗 ")
+        add("المعرف: ", types.MessageEntityBold)
+        add(username_str)
+        add("\n📅 ")
+        add("التاريخ: ", types.MessageEntityBold)
+        add(date_str, types.MessageEntityCode)
+        add("\n⏰ ")
+        add("الوقت: ", types.MessageEntityBold)
+        add(time_str, types.MessageEntityCode)
+        add("\n⏱️ ")
+        add("المدة: ", types.MessageEntityBold)
+        add(duration_str)
+        add("\n📎 ")
+        add("النوع: ", types.MessageEntityBold)
+        add(media_type)
+
+        full_caption = "".join(parts)
+
+        try:
+            file_path = await event.download_media()
+        except Exception as e:
+            print(f"[selfsave] download: {e}")
+            return
+
+        if not file_path or not os.path.exists(file_path):
+            return
+
+        try:
+            await client.send_file(
+                "me",
+                file_path,
+                caption=full_caption,
+                formatting_entities=ents,
+                force_document=False,
+            )
+            print(f"[selfsave] ✅ {sender_name} | {sender_id} | {username_str}")
+        except Exception as e:
+            print(f"[selfsave] send: {e}")
+
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[selfsave] error: {e}")
 
 def _fmt_section(txt):
     """يحوّل قوالب `{p}` و `{header_opa ...}` و `{b}` و `{e}` و `{cmd}` إلى نص منسق"""
@@ -495,12 +685,13 @@ MENU = {
 {b}`{cmd}تشغيل التحويل`{e} — بدء التحويل من المحفوظات
 {b}`{cmd}ايقاف التحويل`{e} — إيقاف التحويل
 {b}`{cmd}ديلاي`{e} — ضبط زمن التحويل""",
-    "م11": """{header_opa امر البروفايل}
+        "م11": """{header_opa امر البروفايل}
 
 {b}`{cmd}تغيير اسم`{e} — تغيير اسمك
 {b}`{cmd}تغيير بايو`{e} — تغيير نبذتك
 {b}`{cmd}تغيير صورة`{e} — بالرد لتغيير صورتك
-{b}`{cmd}حسابي`{e} — عرض معلومات حسابك""",
+{b}`{cmd}حسابي`{e} — عرض معلومات حسابك
+{b}`{cmd}انتحال`{e} — انتحال هوية شخص (اسم + صورة + بايو)""",
     "م12": """{header_opa امر الصيغ}
 
 {b}`{cmd}ملصق`{e} — بالرد على صورة لتحويلها ملصق
@@ -577,9 +768,33 @@ MENU = {
 
 {b}`{cmd}تيك`{e} — تحميل من تيك توك (فيديو/صورة/مزيكا)
 {b}`{cmd}يوت`{e} — بحث في يوتيوب وتحميل الأغنية MP3""",
-}
 
 
+        "م23": """{header_opa اوامر النشر التلقائي}
+
+⚠️ **تنبيه هام:**
+النشر التلقائي على مسؤوليتك الشخصية. قد يعرض حسابك للحظر بسبب سياسة تيليجرام.
+يُفضل تفعيله بوقت طويل (30 دقيقة أو أكثر) ولعدد قليل من المجموعات (أقل من 10).
+
+{b}`{cmd}المجموعات`{e} — عرض كل مجموعاتك بالأرقام
+{b}`{cmd}اضف 1 2 3`{e} — أضف مجموعات بالأرقام
+{b}`{cmd}اضف الكل`{e} — أضف جميع المجموعات
+{b}`{cmd}حذف 1 2`{e} — احذف مجموعات بالأرقام
+{b}`{cmd}حذف الكل`{e} — احذف جميع المجموعات المضافة
+{b}`{cmd}مجموعاتي`{e} — عرض المجموعات المضافة (مرقمة)
+{b}`{cmd}تعيين رساله`{e} — بالرد لتعيين الرسالة
+{b}`{cmd}الرساله`{e} — عرض الرسالة الحالية
+{b}`{cmd}مسح الرساله`{e} — مسح الرسالة
+{b}`{cmd}وقت النشر`{e} — ضبط وقت الإعادة بالدقائق
+{b}`{cmd}بدء النشر`{e} — بدء النشر التلقائي
+{b}`{cmd}ايقاف النشر`{e} — إيقاف النشر
+{b}`{cmd}حالة النشر`{e} — عرض الحالة والإحصائيات""",
+        "م24": """{header_opa اوامر حفظ المؤقتة}
+
+{b}`{cmd}حفظ المؤقتة`{e} — عرض الحالة والشرح
+{b}`{cmd}تشغيل حفظ المؤقتة`{e} — تشغيل حفظ المؤقتة
+{b}`{cmd}تعطيل حفظ المؤقتة`{e} — تعطيل حفظ المؤقتة
+""",}
 @cmd(r"الاوامر$")
 async def _(event):
     await edit_or_reply(event, MENU_MAIN)
@@ -1190,7 +1405,7 @@ async def _locked_watcher(event):
 
 
 PM_WARN_TEXT = (
-    f"**| حماية الخاص — سورس حمزة**\n\n"
+    f"**| حماية الخاص — سورس الجوكر**\n\n"
     "هذا حساب محمي، انتظر موافقة صاحب الحساب.\n"
     "تكرار الرسائل سيؤدي لحظرك."
 )
@@ -1413,7 +1628,87 @@ async def _(event):
     await edit_or_reply(event, txt)
 
 
+@cmd(r"انتحال(?:\s|$)([\s\S]*)")
+async def _(event):
+    user, uid = await get_target_user(event)
+    if not user:
+        return await edit_delete(event, "- رد على شخص أو ضع معرفه", 8)
 
+    m = await event.edit("🎭 جاري سحب بيانات الهدف...")
+
+    # 1. جلب الاسم
+    first_name = (getattr(user, "first_name", "") or "").strip()
+    last_name = (getattr(user, "last_name", "") or "").strip()
+    if not first_name:
+        return await edit_or_reply(m, "❌ الهدف ليس لديه اسم")
+
+    # 2. جلب البايو
+    bio = ""
+    try:
+        full = await client(functions.users.GetFullUserRequest(user))
+        full_user = getattr(full, "full_user", None)
+        if full_user:
+            bio = getattr(full_user, "about", "") or ""
+    except Exception as e:
+        print(f"[impersonate] bio: {e}")
+
+    # 3. سحب الصورة
+    await m.edit("🖼️ جاري سحب الصورة...")
+    photo_path = None
+    try:
+        photo_path = await client.download_profile_photo(
+            user, file=os.path.join(tempfile.gettempdir(), f"imp_{int(time.time())}.jpg")
+        )
+    except Exception as e:
+        print(f"[impersonate] download photo: {e}")
+
+    # 4. تحديث الاسم والبايو
+    await m.edit("✏️ جاري تحديث الاسم والبايو...")
+    try:
+        await client(functions.account.UpdateProfileRequest(
+            first_name=first_name[:64],
+            last_name=last_name[:64],
+            about=bio[:70] if bio else "",
+        ))
+    except Exception as e:
+        return await edit_or_reply(m, f"❌ فشل تحديث الاسم/البايو: `{e}`")
+
+    # 5. تحديث الصورة
+    photo_updated = False
+    if photo_path and os.path.exists(photo_path):
+        await m.edit("📸 جاري تحديث الصورة...")
+        try:
+            try:
+                photos = await client(functions.photos.GetUserPhotosRequest(
+                    user_id=types.InputUserSelf(),
+                    offset=0,
+                    max_id=0,
+                    limit=100,
+                ))
+                if photos.photos:
+                    await client(functions.photos.DeletePhotosRequest(id=photos.photos)
+                    )
+            except Exception as e:
+                print(f"[impersonate] delete old photos: {e}")
+
+            uploaded = await client.upload_file(photo_path)
+            await client(functions.photos.UploadProfilePhotoRequest(file=uploaded))
+            photo_updated = True
+        except Exception as e:
+            print(f"[impersonate] upload photo: {e}")
+        finally:
+            try:
+                os.remove(photo_path)
+            except Exception:
+                pass
+
+    # 6. النتيجة
+    status = f"✅ تم انتحال شخصية {mention(user)} بنجاح\n\n"
+    status += f"👤 **الاسم:** {first_name} {last_name}\n"
+    status += f"📝 **البايو:** {bio[:60] + '...' if len(bio) > 60 else (bio or 'فارغ')}\n"
+    status += f"🖼️ **الصورة:** {'محدثة ✓' if photo_updated else 'لم تُحدث ❌'}"
+
+    await edit_or_reply(m, status)
 
 @cmd(r"ترجمة(?:\s|$)([\s\S]*)")
 async def _(event):
@@ -1456,61 +1751,19 @@ flood_guard = None
 
 
 _DEFAULT_INSULTS = {
-    "qrayb": [
-        "امك", "ابوك", "اختك", "اخوك", "خالتك", "عمتك", "جدتك", "مرتك",
-        "خواتك", "اهلك", "عيلتك", "بنت امك", "ولد عمك", "عمك", "خالك",
-    ],
-    "feal": [
-        "تتناك", "تتوسك", "ترضع الزباب", "تفتح رجليها", "تبيع نفسها",
-        "تشتغل قحبه", "تلحق الرجال", "تتمرمغ", "تركع للكل", "تشحت نيك",
-    ],
-    "jomla": [
-        "بالشارع", "بكل رخص", "قدام الكل", "بالمجان", "من غير ما تستحي",
-        "بطابور طويل", "بكل الكروبات", "وانت تتفرج", "بارخص سعر",
-        "لكل من هب ودب",
-    ],
-    "sifat": [
-        "كسش جعلني فداه", "توكسك", "منيوك", "خرا عليك", "يا معفن",
-        "يا وسخ", "قحبه", "ديوث", "معرص", "يا حقير", "يا زفت", "يا قليل الاصل",
-    ],
-    "laheq": [
-        "وش فيه", "جان شنو", "شكو", "ليش هيك", "عاد", "بعد", "ولك",
-        "يا كلب", "يا خنزير", "ولا شلون", "", "", "",
-    ],
     "sakhira": [
-        "انت ماشي على موال الي يرفع لك سيقان اختك تقعد تمجد له ولا شلون",
-        "من كثر ما انت ذليل صرت تعتبر رفع سيقان محارمك انجاز تفتخر فيه",
-        "كل ما ضاقت عليك الدنيا تروح تنيك اهلك وترجع مبسوط",
-        "لو الذل شخص جان انت ابوه يا ابن الشرموطه الغبيه",
+        "انت تمشي على موال الي يرفع رجلين اختك تكعد تمجد بيه لو شلون؟",
+        "من كثر ما انت ذليل صرت تعتبر رفع رجلين عرضك انجاز تفتخر بيه",
+        "كل ما ضاكت عليك الدنيا تروح تنيج اهلك وترجع فرحان",
+        "نجت اختك الي اسمها أيات خليتها من عيري تسوي اصوات نجت امك من بعد السبات نجتها بكل ثبات عيري بكسمك زرع نبات انيج امك واسوي بكسها شتات من كسها اسوي نهر الفرات انيجها وأسويلي من نيجها حالات انيجها واني كلي صفات من النيج بأمك اني سويت اضفت جهات انيج امك وأخليها تنطق كلمات اركبها وأضل فوكاها بالساعات","ابن الخاضعه وابن الراضعه وعلى عيري متواضعه", "انيج امك بل دربونه اعصربكسهه ليمونه", "انيج اختك بشارع فلسطين واخلي كسهه ينلاخ طين", "انيج امك بملعب برشلونه خلي اشوف كسهه اشونه", 
+"لك ابن بلاعت العيورررره ابن الطيزون اطبب امك شارع الانبار والعب بديوسه الكبار","انييجك نيجه البعير واضربك بعير ستيل","نيجه الحمار شرط بلليل مو بلنهار","ابن التحكه عل رصيف خلي يطلع نضيف كول ماشي عمو تعال انيجك نيجه كوردية اخلك تحك من الصيف للشتوية","ابن التحكه عل مجمده وتكول مامتعمده","ابن الدودكيه ابن السحقايه افتح كس امك بديه وبرجليه","ابن التحكه عل مجمده وتكول مامتعمده","العب على كس اختك اقمار واسوي عليه حرب ودمار عمو عدي عير من الحله للكوت اذا اضربك بي تجي امك تشيله بالتابوت يله ابن السيته فيته ابن التجر العير من لحيته اجر على اختك السيفونه وهيه بنيجها كلش حنونه وطلع من كسها بزونه","لاتضل تهوبز وطوبزتره اشدك على سير النعال ودك بل بسطال من وره النقال","اضرب اختك عيرمنا للزبير وبي معزوفه اذا تشوفه متعوفه","العب على كس اختك اقمار واسوي عليه حرب ودمار عمو عدي عير من الحله للكوت اذا اضربك بي تجي امك تشيله بالتابوت يله ابن السيته فيته ابن التجر العير من لحيته اجر على اختك السيفونه وهيه بنيجها كلش حنونه","انيج اختك وره الباب وتكلي عله كيفك يابو الشباب","انيج اختك وره الباب وتكلي عله كيفك يابو الشباب واشوي عله كسهه تكه وكباب","انيج امك نيجة الحمير واخليه ادنك مثل البعير","اضرب اختك عيركركره اكراد وعرب مجره وتجي امك تعاتبني وتكول ليش نايج بتي اكوخاله كسهه عجبني هاك اخذهاه من عمك المدير وتنح وستدير تف ابلاع لاترجع هاذه رزقك ربك ولد المضغوطه وعله عيري محطوطه","\"انيج امك بل دربونه اعصربكسهه ليمونه\", \"انيج اختك بشارع فلسطين واخلي كسهه ينلاخ طين\", \"انيج امك بملعب برشلونه خلي اشوف كسهه اشونه\",","احط بكس امك موس وسجاجين انيج امك نيجت القرد واخليه تموت من البرد","انيج اختك بشارع فلسطين واخلي كسهه ينلاخ طين","انيج امك بملعب برشلونه خلي اشوف كسهه اشونه","\"ابن الخاضعه وابن الراضعه وعلى عيري متواضعه\","
     ],
-    "templates": [
-        "{qrayb} {feal} {jomla} {sifat}",
-        "{qrayb} {feal} {jomla} {laheq}",
-        "{qrayb} {feal} {jomla}",
-        "{qrayb} {sifat} {laheq}",
-        "{qrayb} {feal} {jomla}، {sifat} {laheq}",
-        "والله {qrayb} {feal} {jomla} {sifat}",
-        "{sifat} {laheq}، {qrayb} {feal} {jomla}",
-        "{qrayb} {feal} {jomla} وانت ساكت يا {sifat}",
-        "{sakhira}",
-        "{sakhira} {sifat}",
-        "على فكرة؟ {sakhira} {laheq}",
-        "{sifat}، {sakhira}",
-        "تعرف انت ايش؟ {sakhira}",
-    ],
-    "حشوات": [
-        "منفوخ", "ممزق", "متسع", "ضيق", "أسود", "متورم", "منكمش", "مبلل",
-        "مقرف", "منتن", "لزج", "ساخن", "ملتهب", "محروق", "منهار",
-    ],
-    "قوالب_فتحات": [
-        "تعرف امك كانت فتحتها كذا ( )، بعد ما شافت زبي صار كذا ( )",
-        "امك يوم شافت زبي قالت ( )، اختك قالت ( )، انا قلت ( )",
-        "كس امك قبل كان ( )، بعد ما سويته صار ( )",
-        "اختك تقول فتحتها ( )، وانا اقولها لا ( )",
-    ],
+    
 }
 
 INSULTS = {}
+
+
 
 
 def _load_insults():
@@ -1525,45 +1778,18 @@ def _load_insults():
 
 
 def insult_combos():
-    """يحسب عدد التركيبات الممكنة"""
-    n = len(INSULTS.get("templates", [1]))
-    for k in ("qrayb", "feal", "jomla", "sifat", "laheq", "sakhira"):
-        n *= max(len(INSULTS.get(k, [""])), 1)
-    fillers = len(INSULTS.get("حشوات") or [1])
-    for ftpl in INSULTS.get("قوالب_فتحات") or []:
-        slots = ftpl.count("(")
-        n += fillers ** max(slots, 1)
-    return n
-
-
-def _fill_blanks(text):
-    """يملأ كل (     ) في النص بعنصر عشوائي من حشوات ويزيل المسافات داخلها"""
-    fillers = INSULTS.get("حشوات") or [""]
-    while "(" in text and ")" in text:
-        text = re.sub(r"\(\s*\)", random.choice(fillers), text, count=1)
-    return text
+    """عدد الجمل المتاحة = عدد جمل sakhira"""
+    return len(INSULTS.get("sakhira", []))
 
 
 def generate_insult():
-    """يولّد جملة سب عشوائية من القوالب والمكوّنات (من JSON)"""
+    """يختار جملة عشوائية من sakhira فقط"""
     if not INSULTS:
         _load_insults()
-    ftpl = INSULTS.get("قوالب_فتحات") or []
-    use_fillable = ftpl and random.random() < 0.4
-    if use_fillable:
-        text = random.choice(ftpl)
-        text = _fill_blanks(text)
-    else:
-        tpl = random.choice(INSULTS["templates"])
-        text = tpl.format(
-            qrayb=random.choice(INSULTS.get("qrayb") or [""]),
-            feal=random.choice(INSULTS.get("feal") or [""]),
-            jomla=random.choice(INSULTS.get("jomla") or [""]),
-            sifat=random.choice(INSULTS.get("sifat") or [""]),
-            laheq=random.choice(INSULTS.get("laheq") or [""]),
-            sakhira=random.choice(INSULTS.get("sakhira") or [""]),
-        )
-    return re.sub(r"\s+", " ", text).strip("، ").strip()
+    sakhira = INSULTS.get("sakhira") or []
+    if not sakhira:
+        return "شنو هل الوجه؟"
+    return random.choice(sakhira).strip()
 
 
 class TextFloodGuard:
@@ -1731,8 +1957,7 @@ async def _forward_loop(chat_id):
 
 
 _INS_KEYS = {
-    "قريب": "qrayb", "فعل": "feal", "جمله": "jomla",
-    "صفه": "sifat", "لاحقه": "laheq", "ساخره": "sakhira", "قالب": "templates",
+    "شد": "sakhira",
 }
 
 
@@ -2918,14 +3143,14 @@ SOURCE_INFO_PATH = os.path.join(DATA_DIR, "source_info.txt")
 def build_source_info():
     """يولّد ملف دليل السورس من قائمة الأوامر MENU + شرح عام"""
     lines = [
-        "=== دليل سورس حمزة (Hamza Userbot) ===",
+        "=== دليل سورس الجوكر (rkkyk Userbot) ===",
         "",
         "نظرة عامة:",
         f"- سورس يوزربوت يعمل على حساب شخصي (Telethon) باسم '{OWNER_NAME}'.",
         f"- البادئة (Prefix) لكل الأوامر هي: {PREFIX}",
         "- كل ميزة لها ملف json خاص في مجلد data/ للتخزين الدائم.",
-        "- لا يوجد بوت مساعد، كل شيء يعمل عبر حساب حمزة مباشرة.",
-        "- يدعم الذكاء الاصطناعي (QuillBot) للرد نيابة عن حمزة، ومولّد سب، وقسم سبام، وإدارة مجموعات، وردود، وتحكم كامل بالحساب.",
+        "- لا يوجد بوت مساعد، كل شيء يعمل عبر حساب الجوكر مباشرة.",
+        "- يدعم الذكاء الاصطناعي (QuillBot) للرد نيابة عن الجوكر، ومولّد سب، وقسم سبام، وإدارة مجموعات، وردود، وتحكم كامل بالحساب.",
         "",
         "=== الأقسام والأوامر ===",
         "",
@@ -3436,7 +3661,7 @@ async def ai_ask(question, event=None, owner_chat=False, with_tools=False):
     source_info = load_source_info()
     parts = [f"[تعليمات النظام]\n{system}"]
     if source_info:
-        parts.append(f"[دليل سورس حمزة — كل ما يجب أن تعرفه عن السورس]\n{source_info}")
+        parts.append(f"[دليل سورس الجوكر — كل ما يجب أن تعرفه عن السورس]\n{source_info}")
     if context:
         parts.append(f"[سياق المحادثة السابقة — آخر {AI_CONTEXT_LIMIT} رسالة]\n{context}")
     if memory:
@@ -3814,7 +4039,7 @@ async def _(event):
     if not arg:
         up = readable_time(time.time() - START_TIME)
         me = await event.client.get_me()
-        txt = f"""**[ سورس حمزة ]**
+        txt = f"""**[ سورس الجوكر ]**
 =========================
 
 **الحالة:** يعمل ✓
@@ -3826,7 +4051,7 @@ async def _(event):
  **التخزين:** JSON
 
  لعرض الأوامر أرسل `{PREFIX}الاوامر`
- للتحديثات والتحسينات اشترك: https://t.me/acjava"""
+ للتحديثات والتحسينات اشترك: https://t.me/rkkyk"""
         return await edit_or_reply(event, txt)
     m = await event.edit("🔍 جاري الفحص...")
     res = await _bc_check(arg)
@@ -4485,114 +4710,7 @@ async def _(event):
 
 
 
-GITHUB_REPO = "Hmza1112617/Hamza-Userbot"
-
-
-def _github_get(path):
-    """طلب متزامن لـ GitHub API (يُشغَّل داخل thread)"""
-    import urllib.request
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/{path}"
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "HamzaUserbot", "Accept": "application/vnd.github+json"},
-    )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode("utf-8", "ignore"))
-
-
-@cmd(r"تحديثات$")
-async def _(event):
-    m = await event.edit("🔄 جاري فحص التحديثات من GitHub...")
-    try:
-        commits = await asyncio.to_thread(_github_get, "commits?per_page=8")
-        lines = ["**| آخر التحديثات والإضافات (GitHub):**\n"]
-        for c in commits:
-            msg = c["commit"]["message"].split("\n")[0][:80]
-            date = c["commit"]["author"]["date"][:10]
-            author = c["commit"]["author"]["name"]
-            lines.append(f"• `{date}` — {msg}\n  بواسطة: {author}")
-        out = "\n".join(lines)
-        out += f"\n\nالمستودع: https://github.com/{GITHUB_REPO}"
-        await edit_or_reply(m, out)
-    except Exception as e:
-        await edit_or_reply(m, f"- خطأ بجلب التحديثات: `{e}`")
-
-
-@cmd(r"اخر_تحديث$")
-async def _(event):
-    m = await event.edit("🔄 ...")
-    try:
-        rel = await asyncio.to_thread(_github_get, "releases/latest")
-        name = rel.get("name") or rel.get("tag_name") or "بدون اسم"
-        body = rel.get("body") or "لا يوجد وصف"
-        notes = body[:1500]
-        await edit_or_reply(m, f"**| آخر إصدار:** `{name}`\n\n{notes}\n\nرابط: {rel.get('html_url','')}")
-    except Exception as e:
-        await edit_or_reply(m, f"- لا يوجد إصدار بعد أو خطأ: `{e}`")
-
-
-import subprocess
-
-RESTART_CMD = [sys.executable, os.path.abspath(__file__)]
-
-
-@cmd(r"تحديث$")
-async def _(event):
-    m = await event.edit("🔄 جاري تنزيل التحديث من GitHub...")
-    db_set("settings", "restart_chat", event.chat_id)
-    db_set("settings", "restart_msg", event.id)
-    try:
-        import shutil, zipfile
-        git_path = shutil.which("git")
-        if git_path:
-            proc = await asyncio.to_thread(
-                subprocess.run,
-                [git_path, "-c", "safe.directory=*", "pull", "origin", "clean-main"],
-                cwd=BASE_DIR, capture_output=True, text=True, timeout=120,
-            )
-            out = (proc.stdout or proc.stderr or "")[:1500]
-            if proc.returncode != 0:
-                await m.edit(f"- فشل السحب عبر git:\n`{out}`\n↻ جاري المحاولة عبر التنزيل المباشر...")
-            else:
-                await m.edit(f" تم تنزيل التحديث:\n`{out}`\n جاري إعادة التشغيل...")
-                await asyncio.sleep(1.5)
-                os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
-                return
-        import urllib.request, io
-        zip_url = f"https://api.github.com/repos/{GITHUB_REPO}/zipball/clean-main"
-        req = urllib.request.Request(zip_url, headers={"User-Agent": "HamzaUserbot", "Accept": "application/vnd.github+json"})
-        data = await asyncio.to_thread(
-            lambda: urllib.request.urlopen(req, timeout=120).read()
-        )
-        import tempfile
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            names = zf.namelist()
-            root = names[0].split("/")[0] if names else ""
-            for name in names:
-                parts = name.split("/", 1)
-                if len(parts) < 2:
-                    continue
-                rel_path = parts[1]
-                if not rel_path:
-                    continue
-                target = os.path.join(BASE_DIR, rel_path)
-                if name.endswith("/"):
-                    os.makedirs(target, exist_ok=True)
-                else:
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    with zf.open(name) as src, open(target, "wb") as dst:
-                        dst.write(src.read())
-        await m.edit(" تم تنزيل واستبدال الملفات ✓\n جاري إعادة التشغيل...")
-        await asyncio.sleep(1.5)
-        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
-    except Exception as e:
-        s = db_read("settings")
-        s.pop("restart_chat", None)
-        s.pop("restart_msg", None)
-        db_write("settings", s)
-        await edit_or_reply(m, f"- خطأ بالتحديث: `{e}`")
-
+# تم حذف أوامر التحديث وقطع الصلاحية عن المطور السابق
 
 @client.on(events.NewMessage(incoming=True))
 async def _ai_auto_watcher(event):
@@ -4879,109 +4997,694 @@ async def _(event):
         _tik_cleanup(tmp_files)
 
 
-_YOUTUBE_RESULTS = {}
-_YT_BIN_CACHE = {}
+# ═══════════════════════════════════════════════════════════
+#  أمر يوتيوب — تحميل MP3 عبر Samplecut (بدون حظر IP)
+# ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#  أمر يوتيوب - النسخة الفخمة (مطابقة لبوتات الميوزك الكبيرة)
+# ═══════════════════════════════════════════════════════════
+from PIL import Image  # تأكد من تثبيت مكتبة Pillow
+# ═══════════════════════════════════════════════════════════
+#  أمر يوتيوب - النسخة الفخمة (مطابقة لبوتات الميوزك الكبيرة)
+# ═══════════════════════════════════════════════════════════
 
+THUMBNAIL_URL = "https://i.ibb.co/0ygLm1zm/3c96cc6464fc59eb3289e5b54afcb5f7.jpg"
+THUMBNAIL_PATH = os.path.join(DATA_DIR, "yt_thumb_original.jpg")
+THUMB_PROCESSED = os.path.join(DATA_DIR, "yt_thumb_ready.jpg")
 
-def _yt_bin():
-    """يعيد مسار ثنائي yt-dlp مع العلمات المناسبة (يحاول static المدمج أولاً)"""
-    if _YT_BIN_CACHE:
-        return _YT_BIN_CACHE["path"], _YT_BIN_CACHE["flags"]
-    import shutil
-    candidates = []
-    for d in (BASE_DIR, "/tmp"):
-        p = os.path.join(d, "yt-dlp-static")
-        if os.path.exists(p):
-            candidates.append((p, ["--no-update", "--impersonate", "chrome"]))
-    for name in ("yt-dlp", "yt-dlp-static"):
-        p = shutil.which(name)
-        if p:
-            flags = ["--no-update"] if "static" in name else []
-            candidates.append((p, flags))
-    for p, flags in candidates:
+_YT_CACHE = {}
+_YT_SEARCH = {}
+
+def _fmt_dur(s):
+    s = int(s or 0)
+    h, m, sec = s // 3600, (s % 3600) // 60, s % 60
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+def _safe_name(title, vid):
+    t = re.sub(r'[\\/:*?"<>|\n\r\t]', '_', title or "").strip()
+    return (re.sub(r'\s+', ' ', t)[:80] or f"audio_{vid}") + ".mp3"
+
+# ───────────── البحث ─────────────
+def _yt_search(q):
+    if q in _YT_SEARCH: return _YT_SEARCH[q]
+    print(f"[search] query={q!r}")
+    for fn in (_yt_search_direct, _yt_search_ytdlp):
+        vid = fn(q)
+        if vid:
+            _YT_SEARCH[q] = vid
+            return vid
+    return None
+
+def _yt_search_direct(q):
+    url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(q)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+        "Accept-Language": "ar,en;q=0.9",
+    })
+    try:
+        html = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
+        m = re.search(r"var ytInitialData = (\{.*?\});</script>", html, re.DOTALL)
+        if m:
+            data = json.loads(m.group(1))
+            def find(o):
+                if isinstance(o, dict):
+                    if "videoRenderer" in o: return o["videoRenderer"].get("videoId")
+                    for v in o.values():
+                        r = find(v)
+                        if r: return r
+                elif isinstance(o, list):
+                    for x in o:
+                        r = find(x)
+                        if r: return r
+                return None
+            vid = find(data)
+            if vid: return vid
+        m = re.search(r'"videoId":"([a-zA-Z0-9_-]{11})"', html)
+        if m: return m.group(1)
+    except Exception as e:
+        print(f"[direct] err: {e}")
+    return None
+
+def _yt_search_ytdlp(q):
+    try:
+        import yt_dlp
+        with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "skip_download": True}) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{q}", download=False)
+            if info and info.get("entries"):
+                return info["entries"][0].get("id")
+    except Exception:
+        pass
+    return None
+
+# ───────────── جلب الصوت من Samplecut ─────────────
+def _samp_fetch(vid):
+    if vid in _YT_CACHE and time.time() - _YT_CACHE[vid]["_ts"] < 3600:
+        return _YT_CACHE[vid]
+
+    def _post(payload):
+        req = urllib.request.Request("https://api.samplecut.app/v1/downloads",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "X-Client-Name": "Joker", "User-Agent": "Mozilla/5.0"},
+            method="POST")
         try:
-            proc = subprocess.check_call(
-                [p, "--no-update", "--version"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=30,
-            )
-            _YT_BIN_CACHE.update({"path": p, "flags": flags})
-            return p, flags
-        except Exception:
-            continue
-    return "yt-dlp", []
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.loads(r.read().decode()), None
+        except urllib.error.HTTPError as e:
+            try: return None, json.loads(e.read().decode()).get("error", {}).get("code")
+            except: return None, None
+        except: return None, None
 
+    data, code = _post({"url": f"https://youtu.be/{vid}"})
+    if code == "too_long":
+        data, _ = _post({"url": f"https://youtu.be/{vid}", "start_sec": 0, "end_sec": 1800})
+    
+    if not data or not data.get("download_url"):
+        return None
 
+    res = {"url": data["download_url"], "title": data.get("title") or "", 
+           "duration": data.get("track_duration_sec") or 0, "_ts": time.time()}
+    _YT_CACHE[vid] = res
+    return res
+
+# ───────────── معالجة الصورة ─────────────
+def _prepare_thumb():
+    try:
+        if not os.path.exists(THUMBNAIL_PATH):
+            req = urllib.request.Request(THUMBNAIL_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                with open(THUMBNAIL_PATH, "wb") as f: f.write(r.read())
+
+        # قص وضغط الصورة لتقبلها تيليجرام (أقل من 200KB و 320x320)
+        img = Image.open(THUMBNAIL_PATH)
+        img.thumbnail((320, 320), Image.LANCZOS)
+        
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+            
+        img.save(THUMB_PROCESSED, format="JPEG", quality=85, optimize=True)
+        
+        with open(THUMB_PROCESSED, "rb") as f:
+            return f.read() # إرجاع الصورة كـ Bytes
+    except Exception as e:
+        print(f"[thumb] Error: {e}")
+        return None
+
+# ───────────── التنزيل ─────────────
+def _download_file(url, out_path):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=300) as r, open(out_path, "wb") as f:
+        while True:
+            chunk = r.read(1024 * 1024)
+            if not chunk: break
+            f.write(chunk)
+
+# ───────────── الأمر الفخم ─────────────
 @cmd(r"يوت(?:\s|$)([\s\S]*)")
 async def _(event):
     query = (event.pattern_match.group(1) or "").strip()
     if not query:
-        return await edit_delete(event, f"- اكتب: {PREFIX}يوت <اسم الأغنية>", 8)
-    m = await event.edit("- جاري البحث في يوتيوب...")
-    binpath, flags = _yt_bin()
+        return await edit_delete(event, f"- اكتب: `{PREFIX}يوت <اسم الأغنية أو رابط>`", 8)
+
+    m = await event.edit("🔍 بحث...")
+    
+    # 1. البحث
+    mm = re.search(r"(?:v=|youtu\.be/|shorts/|/embed/)([a-zA-Z0-9_-]{11})", query)
+    vid = mm.group(1) if mm else await asyncio.to_thread(_yt_search, query)
+    if not vid:
+        return await edit_or_reply(m, "❌ لم أجد الأغنية.")
+
+    # 2. جلب رابط الصوت
+    await m.edit("⬇️ جاري جلب الصوت...")
+    res = await asyncio.to_thread(_samp_fetch, vid)
+    if not res:
+        return await edit_or_reply(m, "❌ فشل جلب الصوت من السيرفر.")
+
+    # 3. تجهيز البيانات
+    title = res["title"] or f"يوتيوب - {vid}"
+    duration = int(res["duration"] or 0)
+    fname = _safe_name(title, vid)
+    audio_url = res["url"]
+
+    # 4. تجهيز الصورة المصغرة
+    thumb_bytes = await asyncio.to_thread(_prepare_thumb)
+
+    # 5. التنزيل المحلي (لضمان ظهور الاسم والصورة)
+    await m.edit("📥 جاري التنزيل والمعالجة...")
+    tmp_path = os.path.join(tempfile.gettempdir(), fname)
     try:
-        proc = await asyncio.create_subprocess_exec(
-            binpath, *flags, "--no-warnings", "--flat-playlist",
-            "--print", "%(id)s | %(duration)s | %(title)s",
-            f"ytsearch5:{query}",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=45)
-        lines = [ln for ln in (out or b"").decode("utf-8", "ignore").splitlines() if ln.strip()]
+        await asyncio.to_thread(_download_file, audio_url, tmp_path)
     except Exception as e:
-        return await edit_or_reply(m, f"X خطأ البحث: `{e}`")
-    if not lines:
-        return await edit_or_reply(m, "X لا توجد نتائج")
-    results = []
-    text = f"**| نتائج البحث:** `{query}`\n\n"
-    for i, ln in enumerate(lines[:5], 1):
-        parts = ln.split(" | ", 2)
-        vid = parts[0].strip()
-        dur = parts[1].strip() if len(parts) > 2 else "?"
-        title = parts[2].strip() if len(parts) > 2 else ln
-        results.append({"id": vid, "title": title, "duration": dur})
-        text += f"`{PREFIX}{i}` — {title}\n⏱ {dur}ث\n\n"
-    text += f"اكتب رقماً مثل `{PREFIX}1` لتحميل الأغنية الأختيارية"
-    _YOUTUBE_RESULTS[event.chat_id] = results
-    await m.edit(text)
+        return await edit_or_reply(m, f"❌ فشل التنزيل: `{e}`")
 
+    if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1024:
+        return await edit_or_reply(m, "❌ الملف تالف أو فارغ.")
 
-@cmd(r"([1-5])$")
-async def _(event):
-    pick = int(event.pattern_match.group(1)) - 1
-    results = _YOUTUBE_RESULTS.get(event.chat_id)
-    if not results:
-        return await edit_delete(event, f"- لا توجد نتائج — استخدم {PREFIX}يوت <الاسم> أولاً", 8)
-    if pick < 0 or pick >= len(results):
-        return await edit_delete(event, "- رقم غير صحيح", 6)
-    item = results[pick]
-    m = await event.edit(f"- جاري تحميل: {item['title']}...")
-    binpath, flags = _yt_bin()
-    tmp = os.path.join(BASE_DIR, f"yt_{_ai_rand_id()}.mp3")
+    # 6. الإرسال الفخم
+    await m.edit("📤 جاري الإرسال...")
+    
+    # النص المطلوب مع الرابط و الإيموجي البريميوم
+    caption_fancy = (
+        f'⌯︙ تم التحميل بنجاح '
+        f'<a href="https://t.me/rkkyk">𝟼𝟼𝟼</a> '
+        f'<tg-emoji emoji-id="5357304199417735018">🎧</tg-emoji>'
+    )
+    
+    attributes = [
+        DocumentAttributeAudio(
+            duration=duration,
+            title=title[:64], 
+            performer="@rkkyk",  # تم التعديل هنا
+            voice=False
+        ),
+        DocumentAttributeFilename(fname)
+    ]
+
     try:
-        proc = await asyncio.create_subprocess_exec(
-            binpath, *flags, "--no-warnings", "-f", "140/ba[ext=m4a]/ba",
-            "-x", "--audio-format", "mp3", "-o", tmp,
-            f"https://www.youtube.com/watch?v={item['id']}",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        kw = dict(
+            file=tmp_path,
+            mime_type="audio/mpeg",
+            attributes=attributes,
+            force_document=False,
+            reply_to=event.reply_to_msg_id
         )
-        await asyncio.wait_for(proc.communicate(), timeout=240)
-        if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
-            return await edit_or_reply(m, "X فشل التنزيل — أعد المحاولة")
-        await client.send_file(event.chat_id, tmp, caption=item["title"][:1024] or None)
+        if thumb_bytes:
+            kw["thumb"] = thumb_bytes 
+
         try:
-            await m.delete()
-        except Exception:
-            pass
-    except Exception as e:
-        await edit_or_reply(m, f"X خطأ: `{e}`")
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
+            # محاولة الإرسال بالتنسيق الفخم والايموجي البريميوم
+            await client.send_file(event.chat_id, caption=caption_fancy, parse_mode="html", **kw)
+        except Exception as html_err:
+            print(f"HTML Error: {html_err}")
+            # إذا فشل ايموجي البريميوم (بسبب اصدار قديم)، يرسل النص بدون ايموجي بريميوم
+            simple_caption = '⌯︙ تم التحميل بنجاح <a href="https://t.me/rkkyk">𝟼𝟼𝟼</a> 🎵'
+            await client.send_file(event.chat_id, caption=simple_caption, parse_mode="html", **kw)
 
+        await m.delete()
+    except Exception as e:
+        await edit_or_reply(m, f"❌ خطأ أثناء الإرسال: `{e}`")
+    finally:
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
+
+
+# ═══════════════════════════════════════════════════════════
+#  م23 — النشر التلقائي (Auto Broadcast)
+# ═══════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════
+#  م23 — النشر التلقائي (Auto Broadcast) — نسخة محصنة
+# ═══════════════════════════════════════════════════════════
+_autobc_task = None
+_autobc_running = False
+
+
+def _autobc_cfg():
+    cfg = db_read("autobc", {})
+    cfg.setdefault("groups", [])
+    cfg.setdefault("message", None)
+    cfg.setdefault("interval", 30)
+    cfg.setdefault("running", False)
+    cfg.setdefault("total_sent", 0)
+    cfg.setdefault("last_sent", 0)
+    cfg.setdefault("_cached_groups", [])
+    return cfg
+
+
+def _autobc_save(cfg):
+    db_write("autobc", cfg)
+
+
+def _rebuild_entities(entities_data):
+    """إعادة بناء كيانات Telegram كما هي بالضبط"""
+    if not entities_data:
+        return None
+    result = []
+    for e in entities_data:
+        try:
+            cls_name = e.get("_")
+            cls = getattr(types, cls_name, None)
+            if cls:
+                # نمرر البيانات كما هي
+                kwargs = {k: v for k, v in e.items() if k != "_"}
+                result.append(cls(**kwargs))
+        except Exception:
+            continue
+    return result if result else None
+
+def _dump_entities(msg):
+    """يحول entities الرسالة إلى dict للحفظ في JSON"""
+    if not msg or not getattr(msg, "entities", None):
+        return None
+    try:
+        # نحفظ كل شي بالضبط بدون حذف
+        return [e.to_dict() for e in msg.entities]
+    except Exception:
+        return None
+
+async def _autobc_loop():
+    """حلقة النشر التلقائي — تُرسل الرسالة لكل المجموعات دورياً"""
+    global _autobc_running
+    _autobc_running = True
+    try:
+        while _autobc_running:
+            cfg = _autobc_cfg()
+            if not cfg.get("running"):
+                break
+            groups = cfg.get("groups", [])
+            msg = cfg.get("message")
+            interval_min = int(cfg.get("interval", 30))
+
+            if not groups or not msg:
+                await asyncio.sleep(30)
+                continue
+
+            text = msg.get("text", "")
+            entities = _rebuild_entities(msg.get("entities"))
+
+            sent_now = 0
+            for gid in groups:
+                if not _autobc_running:
+                    break
+                try:
+                    send_kwargs = {
+                        "entity": int(gid),
+                        "message": text,
+                    }
+                    
+                    # إذا كانت الرسالة تحتوي على تنسيقات (Bold, Italic) مأخوذة من أزرار تيليجرام
+                    if entities:
+                        send_kwargs["formatting_entities"] = entities
+                        send_kwargs["parse_mode"] = None
+                    else:
+                        # إذا كانت الرسالة نص عادي، نعالج الماركداون ونحوله لـ HTML عشان ما يخرب البريميوم
+                        # تحويل **نص** إلى <b>نص</b>
+                        text = text.replace("**", "__BOLD__")
+                        text = text.replace("__BOLD__", "<b>", 1)
+                        text = text.replace("__BOLD__", "</b>", 1)
+                        # تحويل `نص` إلى <code>نص</code>
+                        text = text.replace("`", "__CODE__")
+                        text = text.replace("__CODE__", "<code>", 1)
+                        text = text.replace("__CODE__", "</code>", 1)
+                        
+                        # إذا كانت الرسالة فيها إيموجي بريميوم، نحوله لـ HTML
+                        # (افتراضياً الإيموجي البريميوم في تيليجرام يرسل بـ <tg-emoji>)
+                        send_kwargs["parse_mode"] = "html"
+                        send_kwargs["message"] = text
+
+                    await client.send_message(**send_kwargs)
+                    sent_now += 1
+                    await asyncio.sleep(3)
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds + 1)
+                except Exception:
+                    pass
+
+            cfg = _autobc_cfg()
+            cfg["total_sent"] = cfg.get("total_sent", 0) + sent_now
+            cfg["last_sent"] = time.time()
+            _autobc_save(cfg)
+
+            total_wait = interval_min * 60
+            while total_wait > 0 and _autobc_running:
+                w = min(30, total_wait)
+                await asyncio.sleep(w)
+                total_wait -= w
+    finally:
+        _autobc_running = False
+def _autobc_start_task():
+    global _autobc_task
+    if _autobc_task is None or _autobc_task.done():
+        _autobc_task = asyncio.ensure_future(_autobc_loop())
+
+
+@cmd(r"المجموعات$")
+async def _(event):
+    m = await event.edit("🔍 جاري جمع المجموعات...")
+    groups = []
+    async for dialog in client.iter_dialogs():
+        if dialog.is_group:
+            groups.append(dialog)
+    if not groups:
+        return await edit_or_reply(m, "❌ لا توجد مجموعات في حسابك")
+
+    cfg = _autobc_cfg()
+    cfg["_cached_groups"] = [
+        {"id": d.id, "title": d.name or "بدون اسم"} for d in groups[:100]
+    ]
+    _autobc_save(cfg)
+
+    lines = [f"**📋 مجموعاتك ({len(groups)}):**\n"]
+    for i, d in enumerate(groups[:100], 1):
+        lines.append(f"`{i}.` {d.name} — `{d.id}`")
+    if len(groups) > 100:
+        lines.append(f"\n… و {len(groups) - 100} مجموعة أخرى")
+    lines.append(f"\n**لإضافة:** `{PREFIX}اضف مجموعه <الرقم>`")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n..."
+    await edit_or_reply(m, text)
+
+
+@cmd(r"اضف مجموعه(?:\s|$)([\s\S]*)")
+async def _(event):
+    arg = (event.pattern_match.group(1) or "").strip()
+    reply = await event.get_reply_message()
+    
+    cfg = _autobc_cfg()
+    groups = cfg.get("groups", [])
+    cached = cfg.get("_cached_groups", [])
+
+    if not cached and not reply:
+        return await edit_or_reply(event, f"⚠️ أرسل `{PREFIX}المجموعات` أولاً لعرض القائمة.")
+
+    added_count = 0
+    already_added = 0
+    
+    # 1. الإضافة بالكل
+    if arg in ("الكل", "كل", "all"):
+        if not cached:
+            return await edit_or_reply(event, "⚠️ قائمة المجموعات فارغة.")
+        for g in cached:
+            if g["id"] not in groups:
+                groups.append(g["id"])
+                added_count += 1
+            else:
+                already_added += 1
+                
+    # 2. الإضافة بالأرقام (مثل 1 2 8 7)
+    elif arg and all(x.isdigit() for x in arg.split()):
+        nums = [int(x) for x in arg.split()]
+        for num in nums:
+            idx = num - 1
+            if 0 <= idx < len(cached):
+                gid = cached[idx]["id"]
+                if gid not in groups:
+                    groups.append(gid)
+                    added_count += 1
+                else:
+                    already_added += 1
+        if added_count == 0 and already_added == 0:
+            return await edit_or_reply(event, "⚠️ أرقام غير صحيحة أو خارج القائمة.")
+
+    # 3. الإضافة بالرد
+    elif reply:
+        target_id = None
+        fwd = getattr(reply, "fwd_from", None)
+        if fwd and getattr(fwd, "from_id", None):
+            from_id = fwd.from_id
+            if hasattr(from_id, "channel_id"):
+                target_id = int(f"-100{from_id.channel_id}")
+            elif hasattr(from_id, "chat_id"):
+                target_id = int(f"-100{from_id.chat_id}")
+        elif getattr(reply, "peer_id", None):
+            peer = reply.peer_id
+            if hasattr(peer, "channel_id"):
+                target_id = int(f"-100{peer.channel_id}")
+            elif hasattr(peer, "chat_id"):
+                target_id = int(f"-100{peer.chat_id}")
+                
+        if target_id:
+            if target_id not in groups:
+                groups.append(target_id)
+                added_count += 1
+            else:
+                already_added += 1
+        else:
+            return await edit_or_reply(event, "⚠️ لا يمكن استخراج المجموعة من هذه الرسالة.")
+
+    else:
+        return await edit_or_reply(event, f"⚠️ **طريقة الإضافة:**\n"
+            f"1️⃣ **بالأرقام:** `{PREFIX}اضف مجموعه 1 2 3`\n"
+            f"2️⃣ **بالكل:** `{PREFIX}اضف مجموعه الكل`\n"
+            f"3️⃣ **بالرد:** حول رسالة من المجموعة ورد بـ `{PREFIX}اضف مجموعه`")
+
+    cfg["groups"] = groups
+    _autobc_save(cfg)
+    
+    msg = f"✅ تمت إضافة `{added_count}` مجموعة."
+    if already_added > 0:
+        msg += f"\n⚠️ `{already_added}` كانت مضافة مسبقاً."
+    msg += f"\n📊 الإجمالي الآن: `{len(groups)}`"
+    
+    await edit_or_reply(event, msg)
+
+@cmd(r"ازالة مجموعه(?:\s|$)([\s\S]*)")
+async def _(event):
+    arg = (event.pattern_match.group(1) or "").strip()
+    reply = await event.get_reply_message()
+    
+    cfg = _autobc_cfg()
+    groups = cfg.get("groups", [])
+    
+    if not groups:
+        return await edit_or_reply(event, "⚠️ لا توجد مجموعات مضافة لحذفها.")
+
+    removed_count = 0
+
+    # 1. حذف الكل
+    if arg in ("الكل", "كل", "all"):
+        removed_count = len(groups)
+        groups.clear()
+
+    # 2. الحذف بالأرقام التسلسلية (1 2 3)
+    elif arg and all(x.isdigit() for x in arg.split()):
+        nums = [int(x) for x in arg.split()]
+        nums.sort(reverse=True)
+        for num in nums:
+            idx = num - 1
+            if 0 <= idx < len(groups):
+                groups.pop(idx)
+                removed_count += 1
+        if removed_count == 0:
+            return await edit_or_reply(event, f"⚠️ أرقام غير صحيحة (راجع `{PREFIX}مجموعاتي`).")
+
+    # 3. الحذف بالرد
+    elif reply:
+        target_id = None
+        fwd = getattr(reply, "fwd_from", None)
+        if fwd and getattr(fwd, "from_id", None):
+            from_id = fwd.from_id
+            if hasattr(from_id, "channel_id"):
+                target_id = int(f"-100{from_id.channel_id}")
+            elif hasattr(from_id, "chat_id"):
+                target_id = int(f"-100{from_id.chat_id}")
+        elif getattr(reply, "peer_id", None):
+            peer = reply.peer_id
+            if hasattr(peer, "channel_id"):
+                target_id = int(f"-100{peer.channel_id}")
+            elif hasattr(peer, "chat_id"):
+                target_id = int(f"-100{peer.chat_id}")
+                
+        if target_id:
+            if target_id in groups:
+                groups.remove(target_id)
+                removed_count += 1
+            else:
+                return await edit_or_reply(event, "⚠️ هذه المجموعة ليست في القائمة.")
+        else:
+            return await edit_or_reply(event, "⚠️ لا يمكن استخراج المجموعة من هذه الرسالة.")
+            
+    else:
+        return await edit_or_reply(event, f"⚠️ **طريقة الحذف:**\n"
+            f"1️⃣ **بالأرقام:** `{PREFIX}ازالة مجموعه 1 2 3`\n"
+            f"2️⃣ **بالكل:** `{PREFIX}ازالة مجموعه الكل`\n"
+            f"3️⃣ **بالرد:** حول رسالة من المجموعة ورد بـ `{PREFIX}ازالة مجموعه`")
+
+    cfg["groups"] = groups
+    _autobc_save(cfg)
+    
+    await edit_or_reply(event, f"✅ تم حذف `{removed_count}` مجموعة.\n📊 المتبقي: `{len(groups)}`")
+
+@cmd(r"مجموعاتي$")
+async def _(event):
+    cfg = _autobc_cfg()
+    groups = cfg.get("groups", [])
+    
+    if not groups:
+        return await edit_or_reply(event, f"❌ لا توجد مجموعات مضافة")
+
+    m = await event.edit("🔍 جاري جلب الأسماء...")
+    lines = [f"**📢 مجموعات النشر المضافة ({len(groups)}):**\n"]
+    
+    for i, gid in enumerate(groups, 1):
+        try:
+            ent = await client.get_entity(int(gid))
+            title = getattr(ent, "title", str(gid))
+        except Exception:
+            title = f"(غير متاح: {gid})"
+        lines.append(f"`{i}.` {title}")
+        
+    lines.append(f"\n**للحذف:** `{PREFIX}ازالة مجموعه <الرقم>` (مثلاً `{PREFIX}ازالة مجموعه 1 2`)")
+    await edit_or_reply(m, "\n".join(lines))
+    
+@cmd(r"تعيين رساله(?:\s|$)([\s\S]*)")
+async def _(event):
+    reply = await event.get_reply_message()
+    text = (event.pattern_match.group(1) or "").strip()
+
+    if reply and reply.text:
+        entities_data = _dump_entities(reply)
+        cfg = _autobc_cfg()
+        cfg["message"] = {"text": reply.text, "entities": entities_data}
+        _autobc_save(cfg)
+        entities_count = len(entities_data) if entities_data else 0
+        return await edit_or_reply(
+            event,
+            f"✅ تم التعيين (من الرد)\n📝 النص: `{len(reply.text)}` حرف\n✨ Entities: `{entities_count}`"
+        )
+
+    if text:
+        cfg = _autobc_cfg()
+        cfg["message"] = {"text": text, "entities": None}
+        _autobc_save(cfg)
+        return await edit_or_reply(event, f"✅ تم التعيين\n📝 النص: `{len(text)}` حرف")
+
+    return await edit_delete(event, f"- رد على رسالة، أو اكتب: `{PREFIX}تعيين رساله <النص>`", 8)
+
+
+@cmd(r"الرساله$")
+async def _(event):
+    cfg = _autobc_cfg()
+    msg = cfg.get("message")
+    if not msg:
+        return await edit_or_reply(event, f"❌ لا توجد رسالة معينة")
+
+    text = msg.get("text", "")
+    entities = msg.get("entities") or []
+    await edit_or_reply(
+        event,
+        f"**📝 الرسالة الحالية:**\n\n{text[:500]}{'...' if len(text) > 500 else ''}\n\n"
+        f"📊 الأحرف: `{len(text)}`\n✨ Entities: `{len(entities)}`"
+    )
+
+
+@cmd(r"مسح الرساله$")
+async def _(event):
+    cfg = _autobc_cfg()
+    cfg["message"] = None
+    _autobc_save(cfg)
+    await edit_or_reply(event, "✅ مُسحت")
+
+
+@cmd(r"وقت النشر(?:\s|$)([\s\S]*)")
+async def _(event):
+    arg = (event.pattern_match.group(1) or "").strip()
+    if not arg.isdigit():
+        cfg = _autobc_cfg()
+        return await edit_or_reply(event, f"- اكتب: `{PREFIX}وقت النشر <دقائق>`\nالحالي: `{cfg.get('interval', 30)}`")
+
+    minutes = max(1, int(arg))
+    cfg = _autobc_cfg()
+    cfg["interval"] = minutes
+    _autobc_save(cfg)
+    await edit_or_reply(event, f"✅ الوقت: `{minutes}` دقيقة")
+
+
+@cmd(r"بدء النشر$")
+async def _(event):
+    cfg = _autobc_cfg()
+    groups = cfg.get("groups", [])
+    msg = cfg.get("message")
+
+    if not groups:
+        return await edit_or_reply(event, f"❌ لا توجد مجموعات")
+    if not msg:
+        return await edit_or_reply(event, f"❌ لا توجد رسالة")
+
+    cfg["running"] = True
+    _autobc_save(cfg)
+    _autobc_start_task()
+
+    interval = cfg.get("interval", 30)
+    await edit_or_reply(
+        event,
+        f"🚀 **بدأ النشر**\n📢 `{len(groups)}` مجموعة\n⏱️ كل `{interval}` دقيقة\n🛑 `{PREFIX}ايقاف النشر`"
+    )
+
+
+@cmd(r"ايقاف النشر$")
+async def _(event):
+    global _autobc_running
+    cfg = _autobc_cfg()
+    if not cfg.get("running"):
+        return await edit_or_reply(event, "⚠️ متوقف أصلاً")
+
+    cfg["running"] = False
+    _autobc_save(cfg)
+    _autobc_running = False
+    await edit_or_reply(event, "🛑 تم الإيقاف")
+
+
+@cmd(r"حالة النشر$")
+async def _(event):
+    cfg = _autobc_cfg()
+    groups = cfg.get("groups", [])
+    msg = cfg.get("message")
+    interval = cfg.get("interval", 30)
+    running = cfg.get("running", False)
+    total = cfg.get("total_sent", 0)
+    last = cfg.get("last_sent", 0)
+
+    state = "🟢 يعمل" if running else "🔴 متوقف"
+    last_str = "—"
+    if last:
+        ago = int(time.time() - last)
+        last_str = f"قبل {readable_time(ago)}"
+
+    text = (
+        f"**📊 حالة النشر**\n\n"
+        f"⚡ الحالة: {state}\n"
+        f"📢 المجموعات: `{len(groups)}`\n"
+        f"📝 الرسالة: {'✅' if msg else '❌'}\n"
+        f"⏱️ الفاصل: `{interval}` دقيقة\n"
+        f"📤 إجمالي المرسل: `{total}`\n"
+        f"🕐 آخر: {last_str}"
+    )
+    
+
+    await edit_or_reply(event, text)
 
 async def _follow_checker_loop():
     """يتحقق دورياً من وجود رسائل من الهدف، ويبحث عن أخرى إذا حُذفت"""
@@ -5130,7 +5833,7 @@ async def _startup():
     is_premium = getattr(me, "premium", False)
     flood_guard = TextFloodGuard(is_premium=is_premium)
     print("=" * 45)
-    print(f"  سورس حمزة يعمل الآن ✓")
+    print(f"  سورس الجوكر يعمل الآن ✓")
     print(f"  الحساب: {get_display_name(me)} | {me.id}")
     print(f"  البادئة: {PREFIX} | أرسل {PREFIX}الاوامر")
     print(f"  تركيبات السب: {insult_combos():,}")
@@ -5154,7 +5857,7 @@ async def _startup():
 def _acquire_single_lock():
     """يمنع تشغيل نسختين بنفس السيشن في نفس الوقت (سبب wrong session ID)"""
     import socket as _socket
-    lock_path = os.path.join(DATA_DIR, "hamza.lock")
+    lock_path = os.path.join(DATA_DIR, "joker.lock")
     alive = False
     if os.path.exists(lock_path):
         try:
@@ -5226,7 +5929,7 @@ def main():
                     StringSession(CONFIG["STRING_SESSION"]),
                     CONFIG["API_ID"],
                     CONFIG["API_HASH"],
-                    app_version="حمزة 1.0",
+                    app_version="الجوكر 1.0",
                     auto_reconnect=True,
                     connection_retries=None,
                 )
@@ -5267,7 +5970,7 @@ def main():
                     print(f"فشل إعادة الاتصال: {e2}")
     finally:
         try:
-            os.remove(os.path.join(DATA_DIR, "hamza.lock"))
+            os.remove(os.path.join(DATA_DIR, "joker.lock"))
         except Exception:
             pass
 
